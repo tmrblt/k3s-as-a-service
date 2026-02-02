@@ -299,7 +299,7 @@ NAME            HOST/PORT                                   PATH   SERVICES     
 k3s-api-route   k3s-prod.apps.ocx.sandbox5285.opentlc.com          k3s-api-lb   <all>   passthrough   None
 ```
 
-### LOGIN to MASTER2 GET kubeconfig
+### LOGIN to MASTER1 to GET kubeconfig
 ```
 [bulut@t490s tmp]$ virtctl console k3s-prod-master-1
 Successfully connected to k3s-prod-master-1 console. Press Ctrl+] or Ctrl+5 to exit console.
@@ -350,7 +350,7 @@ server: https://127.0.0.1:6443
 server: https://k3s-prod.apps.ocx.sandbox5285.opentlc.com:443
 ```
 
-### loginto k3s with kubeconfig
+### log into k3s with kubeconfig
 ```
 kubectl get nodes --kubeconfig /tmp/k3s.yaml
 NAME                STATUS   ROLES                AGE   VERSION
