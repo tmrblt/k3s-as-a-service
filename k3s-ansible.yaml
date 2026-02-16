@@ -1,0 +1,292 @@
+---
+- name: Deploy K3s Cluster (Full Sequential & Robust SSL-Proof Version)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    target_namespace: "{{ namespace | default('k3s-test') }}"
+    cluster_prefix_base: "{{ prefix | default('k3s') }}"
+    k3s_token: "{{ token | default('SecretToken123') }}"
+    worker_count: "{{ n | default(3) }}"
+    storage_class: "ocs-storagecluster-ceph-rbd-virtualization"
+    base_image: "docker://quay.io/containerdisks/fedora:40"
+
+  tasks:
+    # 1. INITIALIZATION
+    - name: Generate random suffix
+      set_fact:
+        gen_suffix: "{{ lookup('password', '/dev/null chars=ascii_lowercase length=5') }}"
+
+    - name: Set global facts
+      set_fact:
+        cluster_prefix: "{{ cluster_prefix_base }}-{{ gen_suffix }}"
+        svc_name: "svc-{{ cluster_prefix_base }}-{{ gen_suffix }}"
+        svc_fqdn: "svc-{{ cluster_prefix_base }}-{{ gen_suffix }}.{{ target_namespace }}.svc.cluster.local"
+        common_labels:
+          k3s-cluster: "{{ gen_suffix }}"
+
+    - name: Fetch Ingress Domain (Using Shell to bypass SSL issues)
+      shell: "oc --insecure-skip-tls-verify get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}'"
+      register: ingress_domain
+
+    - name: Define Route Host
+      set_fact:
+        route_host: "{{ cluster_prefix }}.{{ ingress_domain.stdout }}"
+
+    # 2. NETWORKING SETUP
+    - name: Create Service and Route (Bootstrap Focused)
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition: "{{ item }}"
+      loop:
+        - apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ svc_name }}"
+            namespace: "{{ target_namespace }}"
+            labels: "{{ common_labels }}"
+          spec:
+            selector: { k3s-cluster: "{{ gen_suffix }}", k3s_node: "bootstrap" }
+            ports: [{ name: https, protocol: TCP, port: 6443, targetPort: 6443 }]
+        - apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "route-{{ cluster_prefix }}"
+            namespace: "{{ target_namespace }}"
+            labels: "{{ common_labels }}"
+          spec:
+            host: "{{ route_host }}"
+            to: { kind: Service, name: "{{ svc_name }}" }
+            tls: { termination: edge, insecureEdgeTerminationPolicy: Allow }
+
+    # 3. MASTER-0 (Bootstrap Node)
+    - name: Provision Master-0
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ cluster_prefix }}-master0"
+            namespace: "{{ target_namespace }}"
+          spec:
+            runStrategy: Always
+            template:
+              metadata:
+                labels: "{{ common_labels | combine({'k3s_role': 'master', 'k3s_node': 'bootstrap'}) }}"
+              spec:
+                domain:
+                  cpu: { cores: 2 }
+                  resources: { requests: { memory: 4Gi } }
+                  devices:
+                    interfaces: [{ name: default, bridge: {} }]
+                    disks: [{ name: rootdisk, disk: { bus: virtio } }, { name: cloudinitdisk, disk: { bus: virtio } }]
+                networks: [{ name: default, pod: {} }]
+                volumes:
+                  - name: rootdisk
+                    dataVolume: { name: "{{ cluster_prefix }}-master0-dv" }
+                  - name: cloudinitdisk
+                    cloudInitNoCloud:
+                      userData: |
+                        #cloud-config
+                        user: fedora
+                        password: 'password123'
+                        chpasswd: { expire: False }
+                        ssh_pwauth: True
+                        runcmd:
+                          - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+                          - systemctl restart sshd
+                          - curl -sfL https://get.k3s.io | K3S_TOKEN={{ k3s_token }} sh -s - server --cluster-init --tls-san {{ route_host }} --tls-san {{ svc_fqdn }} --write-kubeconfig-mode 644
+            dataVolumeTemplates:
+              - metadata: { name: "{{ cluster_prefix }}-master0-dv" }
+                spec:
+                  storage: { resources: { requests: { storage: 20Gi } }, storageClassName: "{{ storage_class }}" }
+                  source: { registry: { url: "{{ base_image }}" } }
+
+    - name: Wait for Master-0 to be Running
+      shell: "oc --insecure-skip-tls-verify get vmi {{ cluster_prefix }}-master0 -n {{ target_namespace }} --no-headers | grep Running | wc -l"
+      register: m0_wait
+      until: m0_wait.stdout | int == 1
+      retries: 30
+      delay: 10
+
+    # 4. MASTER-1 & MASTER-2 (Joiners)
+    - name: Provision Secondary Masters
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ cluster_prefix }}-master{{ item }}"
+            namespace: "{{ target_namespace }}"
+          spec:
+            runStrategy: Always
+            template:
+              metadata:
+                labels: "{{ common_labels | combine({'k3s_role': 'master', 'k3s_node': 'secondary'}) }}"
+              spec:
+                domain:
+                  cpu: { cores: 2 }
+                  resources: { requests: { memory: 4Gi } }
+                  devices:
+                    interfaces: [{ name: default, bridge: {} }]
+                    disks: [{ name: rootdisk, disk: { bus: virtio } }, { name: cloudinitdisk, disk: { bus: virtio } }]
+                networks: [{ name: default, pod: {} }]
+                volumes:
+                  - name: rootdisk
+                    dataVolume: { name: "{{ cluster_prefix }}-master{{ item }}-dv" }
+                  - name: cloudinitdisk
+                    cloudInitNoCloud:
+                      userData: |
+                        #cloud-config
+                        user: fedora
+                        password: 'password123'
+                        chpasswd: { expire: False }
+                        ssh_pwauth: True
+                        runcmd:
+                          - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+                          - systemctl restart sshd
+                          - until [ "$(curl -sk https://{{ svc_fqdn }}:6443/ping)" == "pong" ]; do sleep 10; done
+                          - curl -sfL https://get.k3s.io | K3S_TOKEN={{ k3s_token }} sh -s - server --server https://{{ svc_fqdn }}:6443 --write-kubeconfig-mode 644
+            dataVolumeTemplates:
+              - metadata: { name: "{{ cluster_prefix }}-master{{ item }}-dv" }
+                spec:
+                  storage: { resources: { requests: { storage: 20Gi } }, storageClassName: "{{ storage_class }}" }
+                  source: { registry: { url: "{{ base_image }}" } }
+      loop: [1, 2]
+
+    - name: Wait for Secondary Masters to be Running
+      shell: "oc --insecure-skip-tls-verify get vmi -n {{ target_namespace }} -l k3s-cluster={{ gen_suffix }},k3s_node=secondary --no-headers | grep Running | wc -l"
+      register: m12_wait
+      until: m12_wait.stdout | int == 2
+      retries: 30
+      delay: 10
+
+    # 5. WORKER NODES
+    - name: Provision Workers
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ cluster_prefix }}-worker{{ item }}"
+            namespace: "{{ target_namespace }}"
+          spec:
+            runStrategy: Always
+            template:
+              metadata:
+                labels: "{{ common_labels | combine({'k3s_role': 'worker'}) }}"
+              spec:
+                domain:
+                  cpu: { cores: 2 }
+                  resources: { requests: { memory: 2Gi } }
+                  devices:
+                    interfaces: [{ name: default, bridge: {} }]
+                    disks: [{ name: rootdisk, disk: { bus: virtio } }, { name: cloudinitdisk, disk: { bus: virtio } }]
+                networks: [{ name: default, pod: {} }]
+                volumes:
+                  - name: rootdisk
+                    dataVolume: { name: "{{ cluster_prefix }}-worker{{ item }}-dv" }
+                  - name: cloudinitdisk
+                    cloudInitNoCloud:
+                      userData: |
+                        #cloud-config
+                        user: fedora
+                        password: 'password123'
+                        chpasswd: { expire: False }
+                        ssh_pwauth: True
+                        runcmd:
+                          - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+                          - systemctl restart sshd
+                          - until [ "$(curl -sk https://{{ svc_fqdn }}:6443/ping)" == "pong" ]; do sleep 15; done
+                          - curl -sfL https://get.k3s.io | K3S_TOKEN={{ k3s_token }} K3S_URL=https://{{ svc_fqdn }}:6443 sh -s - agent
+            dataVolumeTemplates:
+              - metadata: { name: "{{ cluster_prefix }}-worker{{ item }}-dv" }
+                spec:
+                  storage: { resources: { requests: { storage: 20Gi } }, storageClassName: "{{ storage_class }}" }
+                  source: { registry: { url: "{{ base_image }}" } }
+      loop: "{{ range(0, worker_count | int) | list }}"
+
+    - name: Wait for Workers to be Running
+      shell: "oc --insecure-skip-tls-verify get vmi -n {{ target_namespace }} -l k3s-cluster={{ gen_suffix }},k3s_role=worker --no-headers | grep Running | wc -l"
+      register: w_wait
+      until: w_wait.stdout | int == (worker_count | int)
+      retries: 40
+      delay: 15
+
+    # 6. SERVICE TRANSITION
+    - name: Update Service Selector to all Masters
+      kubernetes.core.k8s:
+        state: patched
+        validate_certs: false
+        kind: Service
+        name: "{{ svc_name }}"
+        namespace: "{{ target_namespace }}"
+        definition:
+          spec:
+            selector: { k3s-cluster: "{{ gen_suffix }}", k3s_role: "master" }
+
+    # 7. EXTRACT KUBECONFIG (Internal Alpine Pod Method)
+    - name: Get Master-0 Internal IP (SSL Safe)
+      shell: "oc --insecure-skip-tls-verify get vmi {{ cluster_prefix }}-master0 -n {{ target_namespace }} -o jsonpath='{.status.interfaces[0].ipAddress}'"
+      register: master0_ip
+
+    - name: Helper Pod Kubeconfig Grab
+      block:
+        - name: Deploy Alpine Helper Pod
+          kubernetes.core.k8s:
+            state: present
+            validate_certs: false
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: "k3s-helper-{{ gen_suffix }}"
+                namespace: "{{ target_namespace }}"
+              spec:
+                containers:
+                  - name: helper
+                    image: "quay.io/tamerbulut/k3s-helper:v1"
+                    command: ["/bin/sh", "-c", "sleep 3600"]
+
+        - name: Wait for Helper Pod Status
+          shell: "oc --insecure-skip-tls-verify get pod k3s-helper-{{ gen_suffix }} -n {{ target_namespace }} -o jsonpath='{.status.phase}'"
+          register: h_status
+          until: h_status.stdout == "Running"
+          retries: 20
+          delay: 5
+
+        - name: Read k3s.yaml via SSH in Helper Pod
+          shell: |
+            oc --insecure-skip-tls-verify exec -n {{ target_namespace }} k3s-helper-{{ gen_suffix }} -- /bin/sh -c "sshpass -p 'password123' ssh -o StrictHostKeyChecking=no fedora@{{ master0_ip.stdout }} 'sudo cat /etc/rancher/k3s/k3s.yaml'"
+          register: k3s_yaml_raw
+          until: k3s_yaml_raw.rc == 0
+          retries: 10
+          delay: 15
+
+      always:
+        - name: Cleanup Helper Pod
+          kubernetes.core.k8s:
+            state: absent
+            validate_certs: false
+            kind: Pod
+            name: "k3s-helper-{{ gen_suffix }}"
+            namespace: "{{ target_namespace }}"
+
+    # 8. FINAL OUTPUT
+    - name: Deployment Summary
+      debug:
+        msg:
+          - "=========================================================="
+          - "K3S CLUSTER READY (Suffix: {{ gen_suffix }})"
+          - "=========================================================="
+          - "API URL: https://{{ route_host }}"
+          - "=========================================================="
+          - "KUBECONFIG CONTENT:"
+          - "{{ k3s_yaml_raw.stdout | replace('127.0.0.1', route_host) | replace('6443', '443') | split('\n') }}"
