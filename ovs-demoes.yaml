@@ -1,0 +1,101 @@
+---
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: ovs-br1
+spec:
+  desiredState:
+    interfaces:
+      - copy-mac-from: ens13f1
+        ipv4:
+          enabled: false
+        name: ovs-br1-int0
+        state: up
+        type: ovs-interface
+      - bridge:
+          allow-extra-patch-ports: true
+          options:
+            stp: false
+          port:
+            - name: ens13f1
+            - name: ovs-br1-int0
+        description: |-
+          A dedicated OVS bridge with ens13f1 as a port
+          allowing all VLANs and untagged traffic
+        ipv4:
+          enabled: false
+        name: ovs-br1
+        state: up
+        type: ovs-bridge
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ''
+---
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: localnet-mappings
+spec:
+  desiredState:
+    ovn:
+      bridge-mappings:
+        - bridge: br-ex
+          localnet: localnet-172.16.103
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan150
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan151
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan152
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan153
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan154
+          state: present
+        - bridge: ovs-br1
+          localnet: localnet-vlan155
+          state: present
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ''
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  annotations:
+    k8s.ovn.org/network-id: '5'
+    k8s.ovn.org/network-name: localnet-vlan150
+  name: localnet-vlan150
+  namespace: default
+spec:
+  config: |-
+    {
+            "cniVersion": "0.3.1", 
+            "name": "localnet-vlan150", 
+            "type": "ovn-k8s-cni-overlay", 
+            "topology": "localnet",
+            "vlanID": 150,
+            "mtu": 1500,
+            "netAttachDefName": "default/localnet-vlan150"
+    }
+
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: localnet-vlan152
+  namespace: default
+spec:
+  config: |-
+    {
+            "cniVersion": "0.3.1", 
+            "name": "localnet-vlan152", 
+            "type": "ovn-k8s-cni-overlay", 
+            "topology": "localnet",
+            "vlanID": 152,
+            "mtu": 1500,
+            "netAttachDefName": "default/localnet-vlan152"
+    }

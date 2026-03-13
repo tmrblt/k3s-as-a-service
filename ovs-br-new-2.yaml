@@ -1,0 +1,53 @@
+---
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: br-vmdata-worker00
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker00
+  desiredState:
+    interfaces:
+      - ipv4:
+          dhcp: false
+          enabled: false
+        mtu: 9000
+        name: enp8s0
+        state: up
+        type: ethernet
+      - bridge:
+          allow-extra-patch-ports: true
+          options:
+            stp: false
+          port:
+            - name: enp8s0
+        description: |-
+          A dedicated OVS bridge with enp8s0 as a port
+          allowing all VLANs and untagged traffic.
+        name: br-vmdata
+        state: up
+        type: ovs-bridge
+    ovn:
+      bridge-mappings:
+        - bridge: br-vmdata
+          localnet: vlan-15
+          state: present
+        - bridge: br-vmdata
+          localnet: vlan-20
+          state: present
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: vlan-20
+  namespace: default
+spec:
+  config: |-
+    {
+        "cniVersion": "0.4.0",
+        "name": "vlan-20",
+        "type": "ovn-k8s-cni-overlay",
+        "netAttachDefName": "default/vlan-20",
+        "topology": "localnet",
+        "vlanID": 20
+    }
